@@ -197,6 +197,137 @@ def test_dynamic_input() -> None:
     print("  Cursor never went backward  ✓")
 
 
+def detect_with_haar(image) -> list[Detection]:
+    """Fallback face detector using OpenCV Haar cascade (no Triton needed)."""
+    import cv2
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    rects = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
+    detections = []
+    for x, y, w, h in rects:
+        detections.append(
+            Detection(bbox=BBox(x1=int(x), y1=int(y), x2=int(x + w), y2=int(y + h)), score=1.0)
+        )
+    return detections
+
+
+def test_detector_pipeline() -> None:
+    """Load real image → detect faces → sort via Scanner.
+
+    Tries Triton detector first, falls back to OpenCV Haar cascade.
+    """
+    import cv2
+    from src.config import Config
+    from src.detector import Detector, HAS_TRITON
+
+    print("\n" + "=" * 60)
+    print("TEST: Detector → Scanner pipeline (real image)")
+    print("=" * 60)
+
+    PHOTO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "photo")
+    photos = sorted(f for f in os.listdir(PHOTO_DIR) if f.lower().endswith((".jpg", ".png")))
+    if not photos:
+        print("  No photos found in data/photo/")
+        return
+
+    # ── Load multiple photos and arrange detections as panoramic ───
+    # Each photo's face gets placed side-by-side to simulate a panoramic view
+    offset_x = 0
+    all_detections: list[Detection] = []
+    image_names: list[str] = []
+
+    for fname in photos[:5]:  # use up to 5 photos
+        path = os.path.join(PHOTO_DIR, fname)
+        img = cv2.imread(path)
+        if img is None:
+            print(f"  SKIP {fname}: cannot read")
+            continue
+
+        h, w = img.shape[:2]
+
+        # Try Triton detector, fall back to Haar
+        detections = []
+        if HAS_TRITON:
+            config = Config({
+                "triton": {"url": "localhost:8001", "detection_model": "face_detection",
+                           "detection_input_size": [640, 640]},
+                "detection": {"score_threshold": 0.5, "min_face_width": 30, "min_face_height": 30},
+                "video": {"panoramic_url": "mock"},
+                "device": {"address": "mock", "username": "mock", "password": "mock"},
+                "vector_db": {"path": ":memory:"},
+            })
+            det = Detector(config)
+            if det.health_check():
+                detections = det.detect(img)
+                print(f"  {fname}: Triton detected {len(detections)} face(s)")
+            else:
+                print(f"  {fname}: Triton not available, using Haar cascade")
+
+        if not detections:
+            detections = detect_with_haar(img)
+
+        # Shift detection coordinates to panoramic layout
+        for d in detections:
+            shifted = Detection(
+                bbox=BBox(
+                    x1=d.bbox.x1 + offset_x,
+                    y1=d.bbox.y1,
+                    x2=d.bbox.x2 + offset_x,
+                    y2=d.bbox.y2,
+                ),
+                score=d.score,
+            )
+            all_detections.append(shifted)
+            image_names.append(fname)
+
+        offset_x += w
+
+    if not all_detections:
+        print("  No faces detected in any photo")
+        return
+
+    # ── Print raw detections ───────────────────────────────────────
+    print(f"\n--- Raw detections ({len(all_detections)} faces from {len(set(image_names))} images) ---")
+    for i, (d, name) in enumerate(zip(all_detections, image_names)):
+        b = d.bbox
+        print(f"  [{i}] {name:12s}  ({b.x1:4d},{b.y1:4d})-({b.x2:4d},{b.y2:4d})  "
+              f"cx={b.cx:6.0f} cy={b.cy:5.0f}  score={d.score:.2f}")
+
+    # ── Sort ────────────────────────────────────────────────────────
+    config = Config({
+        "scan": {"row_bucket": 80},
+        "video": {"panoramic_url": "mock"},
+        "device": {"address": "mock", "username": "mock", "password": "mock"},
+        "triton": {"url": "mock"},
+        "vector_db": {"path": ":memory:"},
+    })
+    scanner = Scanner(config)
+    sorted_faces = scanner.sort_faces(all_detections)
+
+    print(f"\n--- Sorted (top→bottom, left→right, row_bucket=80) ---")
+    for i, d in enumerate(sorted_faces):
+        b = d.bbox
+        row_bkt = int(b.cy // 80)
+        idx = all_detections.index(d)
+        print(f"  [{i}] {image_names[idx]:12s}  cx={b.cx:6.0f} cy={b.cy:5.0f}  row_bucket={row_bkt}")
+
+    # ── Simulate cursor progression ────────────────────────────────
+    print(f"\n--- Scan-cursor progression ---")
+    while True:
+        target = scanner.select_next(sorted_faces)
+        if target is None:
+            print("  -> No more targets")
+            break
+        tid, det = target
+        b = det.bbox
+        idx = all_detections.index(det)
+        print(f"  -> Target #{tid:2d}  {image_names[idx]:12s}  "
+              f"cx={b.cx:6.0f} cy={b.cy:5.0f}")
+
+
 if __name__ == "__main__":
     main()
     test_dynamic_input()
+    test_detector_pipeline()
