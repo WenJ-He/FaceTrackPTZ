@@ -1,0 +1,65 @@
+# FaceTrack PTZ Configuration
+
+video:
+  panoramic_url: "rtsp://admin:vision123456@192.168.0.248:554/Streaming/Channels/101"
+  ptz_url: "rtsp://admin:vision123456@192.168.0.248:554/Streaming/Channels/201"
+
+device:
+  address: "192.168.0.248"
+  port: 8000
+  username: "admin"
+  password: "vision123456"
+  channel: 2
+  panoramic_resolution:
+    cols: 3632
+    rows: 1632
+  box_percent: 0.5
+
+triton:
+  url: "localhost:8001"
+  detection_model: "face_detection"
+  recognition_model: "face_recognition"
+  detection_input_size: [640, 640]
+  recognition_input_size: [112, 112]
+
+detection:
+  score_threshold: 0.5
+  min_face_width: 30
+  min_face_height: 30
+  detect_interval_ms: 500
+
+recognition:
+  recognition_accept_threshold: 0.6
+  min_similarity_gain: 0.02
+  top_k: 5
+
+scan:
+  row_bucket: 80
+  max_zoom_stages: 5
+  ptz_stable_wait_ms: 1500
+  ptz_retry: 3
+
+vector_db:
+  type: "sqlite"
+  path: "./data/face_vectors.db"
+
+report:
+  output_dir: "./reports"
+  format: "both"
+
+overlay:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8080
+
+logging:
+  level: "INFO"
+  file: "./logs/facetrack.json"
+
+reconnect:
+  interval_ms: 5000
+
+ptz:
+  mode: "isapi"
+  ctrl_binary: ""
+  ctrl_lib_path: ""

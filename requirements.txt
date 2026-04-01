@@ -1,0 +1,11 @@
+opencv-python>=4.8.0
+numpy>=1.24.0
+tritonclient[grpc]>=2.40.0
+PyYAML>=6.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+requests>=2.31.0
+requests-auth>=1.0.0
+python-multipart>=0.0.6
+jinja2>=3.1.0
+Pillow>=10.0.0
