@@ -75,14 +75,14 @@ class Recognizer:
         blob = blob.transpose(2, 0, 1)
         blob = np.expand_dims(blob, axis=0)
 
-        inputs = [InferInput("input", blob.shape, "FP32")]
+        inputs = [InferInput("input.1", blob.shape, "FP32")]
         inputs[0].set_data_from_numpy(blob)
 
-        outputs = [InferRequestedOutput("output")]
+        outputs = [InferRequestedOutput("1333")]
 
         try:
             response = self._client.infer(self._model_name, inputs, outputs=outputs)
-            vector = response.as_numpy("output")
+            vector = response.as_numpy("1333")
             if vector is not None and vector.ndim >= 2:
                 return vector[0].flatten()
             return None

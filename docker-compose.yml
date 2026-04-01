@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  triton:
+    image: nvcr.io/nvidia/tritonserver:24.01-py3
+    container_name: facetrack-triton
+    command: tritonserver --model-repository=/models
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+      - "8002:8002"
+    volumes:
+      - ./models:/models
+    shm_size: "1g"

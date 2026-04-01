@@ -57,10 +57,10 @@ class Detector:
     def _warmup(self) -> None:
         """Send a dummy inference to warm up the model."""
         dummy = np.zeros((1, 3, self._input_h, self._input_w), dtype=np.float32)
-        inputs = [InferInput("input", dummy.shape, "FP32")]
+        inputs = [InferInput("images", dummy.shape, "FP32")]
         inputs[0].set_data_from_numpy(dummy)
         try:
-            self._client.infer(self._model_name, inputs)
+            self._client.infer(self._model_name, inputs, outputs=[InferRequestedOutput("output0")])
         except Exception:
             pass
 
@@ -78,16 +78,16 @@ class Detector:
         blob = blob.transpose(2, 0, 1)  # HWC -> CHW
         blob = np.expand_dims(blob, axis=0)  # add batch dim
 
-        inputs = [InferInput("input", blob.shape, "FP32")]
+        inputs = [InferInput("images", blob.shape, "FP32")]
         inputs[0].set_data_from_numpy(blob)
 
-        outputs = [InferRequestedOutput("output")]
+        outputs = [InferRequestedOutput("output0")]
 
         try:
             t0 = time.time()
             response = self._client.infer(self._model_name, inputs, outputs=outputs)
             infer_ms = (time.time() - t0) * 1000
-            raw = response.as_numpy("output")
+            raw = response.as_numpy("output0")
         except Exception as e:
             log.log(f"Detection inference failed: {e}", result="ERROR")
             return []
@@ -120,6 +120,10 @@ class Detector:
         if raw.ndim == 3:
             raw = raw[0]  # remove batch dim
 
+        # YOLO output: [5, 8400] → transpose to [8400, 5]
+        if raw.shape[0] == 5 and raw.shape[0] < raw.shape[1]:
+            raw = raw.T
+
         detections: List[Detection] = []
         scale_x = orig_w / input_w
         scale_y = orig_h / input_h
@@ -131,10 +135,12 @@ class Detector:
             if score < self._score_threshold:
                 continue
 
-            x1 = int(max(0, row[0]) * scale_x)
-            y1 = int(max(0, row[1]) * scale_y)
-            x2 = int(min(orig_w, row[2]) * scale_x)
-            y2 = int(min(orig_h, row[3]) * scale_y)
+            # YOLO cx,cy,w,h → x1,y1,x2,y2
+            cx, cy, bw, bh = row[0], row[1], row[2], row[3]
+            x1 = int(max(0, cx - bw / 2) * scale_x)
+            y1 = int(max(0, cy - bh / 2) * scale_y)
+            x2 = int(min(orig_w, cx + bw / 2) * scale_x)
+            y2 = int(min(orig_h, cy + bh / 2) * scale_y)
 
             bbox = BBox(x1=x1, y1=y1, x2=x2, y2=y2)
             if bbox.width < self._min_face_w or bbox.height < self._min_face_h:
