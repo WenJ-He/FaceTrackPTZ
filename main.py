@@ -327,7 +327,108 @@ def test_detector_pipeline() -> None:
               f"cx={b.cx:6.0f} cy={b.cy:5.0f}")
 
 
+def test_ptz_scheduling() -> None:
+    """Scanner → PTZController scheduling chain.
+
+    Uses mock PTZ (no real device). For each target the scanner picks,
+    calculates PTZ coordinates and simulates multi-stage zoom execution.
+    """
+    import cv2
+    from src.config import Config
+    from src.ptz_controller import PTZController
+
+    print("\n" + "=" * 60)
+    print("TEST: Scanner → PTZ scheduling (mock device)")
+    print("=" * 60)
+
+    PHOTO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "photo")
+    photos = sorted(f for f in os.listdir(PHOTO_DIR) if f.lower().endswith((".jpg", ".png")))
+    if not photos:
+        print("  No photos found in data/photo/")
+        return
+
+    config = Config({
+        "scan": {"row_bucket": 80, "max_zoom_stages": 3,
+                 "ptz_stable_wait_ms": 100, "ptz_retry": 2},
+        "device": {
+            "address": "mock",
+            "port": 8000,
+            "username": "mock",
+            "password": "mock",
+            "channel": 2,
+            "panoramic_resolution": {"cols": 6000, "rows": 2000},
+            "box_percent": 0.5,
+        },
+        "video": {"panoramic_url": "mock"},
+        "triton": {"url": "mock"},
+        "vector_db": {"path": ":memory:"},
+    })
+
+    scanner = Scanner(config)
+    ptz = PTZController(config)
+
+    # ── Build detections from photos (panoramic layout) ────────────
+    offset_x = 0
+    all_detections: list[Detection] = []
+    image_names: list[str] = []
+
+    for fname in photos[:5]:
+        img = cv2.imread(os.path.join(PHOTO_DIR, fname))
+        if img is None:
+            continue
+        for d in detect_with_haar(img):
+            shifted = Detection(
+                bbox=BBox(
+                    x1=d.bbox.x1 + offset_x, y1=d.bbox.y1,
+                    x2=d.bbox.x2 + offset_x, y2=d.bbox.y2,
+                ),
+                score=d.score,
+            )
+            all_detections.append(shifted)
+            image_names.append(fname)
+        offset_x += img.shape[1]
+
+    if not all_detections:
+        print("  No faces detected")
+        return
+
+    sorted_faces = scanner.sort_faces(all_detections)
+    print(f"  {len(sorted_faces)} faces sorted\n")
+
+    # ── Schedule: scanner → PTZ for each target ────────────────────
+    max_stages = config.get("scan.max_zoom_stages")
+    target_idx = 0
+
+    while True:
+        target = scanner.select_next(sorted_faces)
+        if target is None:
+            print("  === No more targets, round complete ===")
+            break
+
+        tid, det = target
+        b = det.bbox
+        idx = all_detections.index(det)
+        target_idx += 1
+
+        print(f"  ── Target #{tid}  ({image_names[idx]})  "
+              f"bbox=({b.x1},{b.y1})-({b.x2},{b.y2}) ──")
+
+        # Stage 0: record only (no PTZ move)
+        print(f"    Stage 0 (panoramic):  cx={b.cx:.0f} cy={b.cy:.0f}")
+
+        # Stages 1..N: calculate PTZ coords, simulate move
+        for stage in range(1, max_stages + 1):
+            rect = ptz.calculate_coordinates(b, stage_num=stage)
+            print(f"    Stage {stage}:  PTZ rect=({rect[0]:3d},{rect[1]:3d},{rect[2]:3d},{rect[3]:3d})  "
+                  f"→ [mock move OK, wait stable]")
+
+        print(f"    ✓ target done\n")
+
+    print(f"  Total targets scheduled: {target_idx}")
+
+
 if __name__ == "__main__":
     main()
     test_dynamic_input()
     test_detector_pipeline()
+    test_ptz_scheduling()
