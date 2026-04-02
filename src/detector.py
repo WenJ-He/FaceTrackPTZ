@@ -20,6 +20,36 @@ from .models import BBox, Detection
 from . import logger as log
 
 
+def nms(detections: List[Detection], iou_threshold: float = 0.5) -> List[Detection]:
+    """Non-Maximum Suppression: remove highly overlapping boxes, keep highest score."""
+    if len(detections) <= 1:
+        return detections
+
+    sorted_dets = sorted(detections, key=lambda d: d.score, reverse=True)
+    keep: List[Detection] = []
+
+    for det in sorted_dets:
+        suppressed = False
+        b = det.bbox
+        for kept in keep:
+            k = kept.bbox
+            ix1 = max(b.x1, k.x1)
+            iy1 = max(b.y1, k.y1)
+            ix2 = min(b.x2, k.x2)
+            iy2 = min(b.y2, k.y2)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            area_a = (b.x2 - b.x1) * (b.y2 - b.y1)
+            area_b = (k.x2 - k.x1) * (k.y2 - k.y1)
+            iou = inter / (area_a + area_b - inter) if (area_a + area_b - inter) > 0 else 0
+            if iou > iou_threshold:
+                suppressed = True
+                break
+        if not suppressed:
+            keep.append(det)
+
+    return keep
+
+
 class Detector:
     """Face detection via Triton gRPC."""
 
@@ -32,6 +62,7 @@ class Detector:
         self._score_threshold = config.get("detection.score_threshold", 0.5)
         self._min_face_w = config.get("detection.min_face_width", 30)
         self._min_face_h = config.get("detection.min_face_height", 30)
+        self._nms_iou_threshold = config.get("detection.nms_iou_threshold", 0.5)
         self._client: Optional[object] = None
         self._ready = False
 
@@ -97,7 +128,7 @@ class Detector:
 
         detections = self._parse_output(raw, w, h, input_w, input_h)
         log.log(
-            f"Detected {len(detections)} faces ({infer_ms:.0f}ms)",
+            f"Detected {len(detections)} faces after NMS ({infer_ms:.0f}ms)",
             result="OK",
             extra_data={"face_count": len(detections), "infer_ms": round(infer_ms, 1)},
         )
@@ -161,7 +192,7 @@ class Detector:
 
             detections.append(det)
 
-        return detections
+        return nms(detections, self._nms_iou_threshold)
 
     @property
     def ready(self) -> bool:

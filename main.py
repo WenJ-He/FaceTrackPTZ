@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.config import Config
 from src.vector_db import VectorDB
 from src.scanner import Scanner
+from src.detector import nms
 from src.models import BBox, Detection
 from src.logger import setup_logging
 
@@ -32,7 +33,7 @@ MODEL_REC = os.path.join(PROJECT, "models", "facerecognize", "1", "model.onnx")
 PHOTO_DIR = os.path.join(PROJECT, "data", "photo")
 
 
-def detect_faces(session, frame, score_thresh=0.5):
+def detect_faces(session, frame, score_thresh=0.5, nms_iou=0.5):
     h, w = frame.shape[:2]
     blob = cv2.dnn.blobFromImage(frame, 1.0 / 255.0, (640, 640), swapRB=True)
     raw = session.run(["output0"], {"images": blob})[0]
@@ -49,8 +50,7 @@ def detect_faces(session, frame, score_thresh=0.5):
         x2 = int((cx + bw / 2) * sx)
         y2 = int((cy + bh / 2) * sy)
         results.append(Detection(bbox=BBox(x1=x1, y1=y1, x2=x2, y2=y2), score=score))
-    results.sort(key=lambda d: d.score, reverse=True)
-    return results
+    return nms(results, nms_iou)
 
 
 def extract_embedding(session, frame, bbox):
