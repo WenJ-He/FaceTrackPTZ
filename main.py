@@ -1,434 +1,150 @@
-"""Minimal main.py — verify scanner sorting and scan-cursor logic only.
-
-Uses mock detections, no video/Triton/PTZ/recognition.
+"""FaceTrack PTZ — Minimal main flow: image -> detect -> sort -> identify.
 
 Usage:
-    python main.py
+    python3 main.py [image_path]
+
+If no image_path given, uses first photo from data/photo/.
 """
 
 from __future__ import annotations
 
-import sys
+import argparse
+import glob
 import os
+import sys
+import time
+
+import cv2
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src.models import BBox, Detection
+from src.config import Config
+from src.vector_db import VectorDB
 from src.scanner import Scanner
+from src.models import BBox, Detection
+from src.logger import setup_logging
+
+PROJECT = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(PROJECT, "data", "face_db.sqlite")
+MODEL_DET = os.path.join(PROJECT, "models", "facedect", "1", "model.onnx")
+MODEL_REC = os.path.join(PROJECT, "models", "facerecognize", "1", "model.onnx")
+PHOTO_DIR = os.path.join(PROJECT, "data", "photo")
 
 
-# ── Mock data ──────────────────────────────────────────────────────
-MOCK_FACES = [
-    # (x1, y1, x2, y2, score)  — deliberately out of scan order
-    (800,  400, 880, 500, 0.92),   # mid-right, row 1
-    (100,  50,  170, 130, 0.95),   # top-left,   row 0
-    (500,  300, 580, 390, 0.88),   # mid-center, row 1
-    (300,  160, 370, 240, 0.85),   # left-center,row 0
-    (1200, 100, 1280, 190, 0.80),  # top-right,  row 0
-]
+def detect_faces(session, frame, score_thresh=0.5):
+    h, w = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(frame, 1.0 / 255.0, (640, 640), swapRB=True)
+    raw = session.run(["output0"], {"images": blob})[0]
+    preds = raw[0].T
+    results = []
+    for row in preds:
+        score = float(row[4])
+        if score < score_thresh:
+            continue
+        cx, cy, bw, bh = row[0], row[1], row[2], row[3]
+        sx, sy = w / 640, h / 640
+        x1 = int((cx - bw / 2) * sx)
+        y1 = int((cy - bh / 2) * sy)
+        x2 = int((cx + bw / 2) * sx)
+        y2 = int((cy + bh / 2) * sy)
+        results.append(Detection(bbox=BBox(x1=x1, y1=y1, x2=x2, y2=y2), score=score))
+    results.sort(key=lambda d: d.score, reverse=True)
+    return results
 
 
-def build_detections() -> list[Detection]:
-    return [
-        Detection(
-            bbox=BBox(x1=x1, y1=y1, x2=x2, y2=y2),
-            score=score,
-        )
-        for x1, y1, x2, y2, score in MOCK_FACES
-    ]
+def extract_embedding(session, frame, bbox):
+    x1, y1 = max(0, bbox.x1), max(0, bbox.y1)
+    x2, y2 = min(frame.shape[1], bbox.x2), min(frame.shape[0], bbox.y2)
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+    crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    crop = cv2.resize(crop, (112, 112))
+    blob = crop.astype(np.float32) / 255.0
+    blob = blob.transpose(2, 0, 1)[np.newaxis]
+    return session.run(["1333"], {"input.1": blob})[0][0].flatten()
 
 
-def print_det(idx: int, det: Detection) -> None:
-    b = det.bbox
-    print(
-        f"  [{idx}] ({b.x1:4d},{b.y1:4d})-({b.x2:4d},{b.y2:4d})  "
-        f"cx={b.cx:6.0f} cy={b.cy:5.0f}  score={det.score:.2f}"
-    )
+def run(image_path):
+    import onnxruntime as ort
 
+    setup_logging("INFO")
+    config = Config({
+        "scan": {"row_bucket": 80},
+        "detection": {"score_threshold": 0.5},
+        "recognition": {"top_k": 5},
+        "video": {"panoramic_url": "mock"},
+        "device": {"address": "mock", "username": "mock", "password": "mock"},
+        "triton": {"url": "mock"},
+        "vector_db": {"path": DB_PATH},
+    })
 
-# ── Main ───────────────────────────────────────────────────────────
-def main() -> None:
-    # Minimal config needed by Scanner (only scan.row_bucket matters)
-    from src.config import Config
-    config = Config({"scan": {"row_bucket": 80}, "video": {"panoramic_url": "mock"}, "device": {"address": "mock", "username": "mock", "password": "mock"}, "triton": {"url": "mock"}, "vector_db": {"path": ":memory:"}})
+    db = VectorDB(config)
+    db.open()
+    print(f"VectorDB: {db.count()} identities")
+
+    det_session = ort.InferenceSession(MODEL_DET)
+    rec_session = ort.InferenceSession(MODEL_REC)
+    img = cv2.imread(image_path)
+    if img is None:
+        print(f"Cannot read: {image_path}")
+        return
+    print(f"\nImage: {os.path.basename(image_path)} ({img.shape[1]}x{img.shape[0]})")
 
     scanner = Scanner(config)
 
-    detections = build_detections()
+    t0 = time.time()
+    detections = detect_faces(det_session, img, 0.5)
+    det_ms = (time.time() - t0) * 1000
+    print(f"Detected {len(detections)} face(s) in {det_ms:.0f}ms")
 
-    print("=== Raw detections (input order) ===")
-    for i, d in enumerate(detections):
-        print_det(i, d)
+    if not detections:
+        print("No faces detected")
+        return
 
-    # ── Sort ───────────────────────────────────────────────────────
     sorted_faces = scanner.sort_faces(detections)
 
-    print("\n=== Sorted (top→bottom, left→right, row_bucket=80) ===")
-    for i, d in enumerate(sorted_faces):
-        b = d.bbox
-        row_bkt = int(b.cy // 80)
-        print(f"  [{i}] cx={b.cx:6.0f} cy={b.cy:5.0f}  row_bucket={row_bkt}")
+    print(f"\n{'Tgt':>4}  {'Identity':12s}  {'Sim':>10}  {'Score':>6}  {'BBox'}")
+    print("-" * 65)
 
-    # ── Simulate scan-cursor progression ───────────────────────────
-    print("\n=== Scan-cursor simulation ===")
-    round_num = 1
-
-    while True:
-        print(f"\n--- Round {round_num} ---")
-        print(f"  cursor: {scanner.cursor_position}")
-
-        target = scanner.select_next(sorted_faces)
-
-        if target is None:
-            print("  No more targets → reset cursor, start new round")
-            scanner.reset_round()
-            # Try one more round to prove reset works
-            if round_num >= 2:
-                print("\n  (second round re-selects same targets, stop here)")
-                target = scanner.select_next(sorted_faces)
-                if target:
-                    tid, det = target
-                    print(f"  -> Target #{tid} selected: cx={det.bbox.cx:.0f} cy={det.bbox.cy:.0f}")
-                break
-            round_num += 1
-            continue
-
-        tid, det = target
-        b = det.bbox
-        print(f"  -> Target #{tid}  cx={b.cx:.0f} cy={b.cy:.0f}")
-        print(f"    cursor now: {scanner.cursor_position}")
-
-
-def _label(det: Detection) -> str:
-    """Human-readable label based on cx for easy tracking."""
-    b = det.bbox
-    if b.cx < 200:
-        return "A"
-    if b.cx < 400:
-        return "B"
-    if b.cx < 600:
-        return "C"
-    if b.cx < 1000:
-        return "D"
-    return "E"
-
-
-def test_dynamic_input() -> None:
-    """Verify cursor behavior when detections change between rounds.
-
-    Round 1: faces = [A, B, C]  →  scan A then B
-    Round 1 (re-detect): faces = [B, C, D]  →  cursor after B, should skip A (gone),
-             skip B (already past), pick C then D
-    """
-    print("\n" + "=" * 60)
-    print("TEST: Dynamic input change — cursor must not go backward")
-    print("=" * 60)
-
-    from src.config import Config
-    config = Config({
-        "scan": {"row_bucket": 80},
-        "video": {"panoramic_url": "mock"},
-        "device": {"address": "mock", "username": "mock", "password": "mock"},
-        "triton": {"url": "mock"},
-        "vector_db": {"path": ":memory:"},
-    })
-    scanner = Scanner(config)
-
-    # ── Round 1: faces [A, B, C] ──────────────────────────────────
-    faces_r1 = [
-        Detection(bbox=BBox(x1=100, y1=50,  x2=170, y2=130), score=0.95),  # A  cx=135
-        Detection(bbox=BBox(x1=300, y1=160, x2=370, y2=240), score=0.90),  # B  cx=335
-        Detection(bbox=BBox(x1=500, y1=300, x2=580, y2=390), score=0.88),  # C  cx=540
-    ]
-
-    sorted_r1 = scanner.sort_faces(faces_r1)
-    print("\nRound 1 detections (sorted): "
-          + ", ".join(_label(d) for d in sorted_r1))
-
-    # Process A
-    tid_a, det_a = scanner.select_next(sorted_r1)
-    assert tid_a == 1, f"Expected target #1, got #{tid_a}"
-    assert _label(det_a) == "A", f"Expected A, got {_label(det_a)}"
-    print(f"  -> #{tid_a} {_label(det_a)}   cursor: {scanner.cursor_position}")
-
-    # Process B
-    tid_b, det_b = scanner.select_next(sorted_r1)
-    assert tid_b == 2, f"Expected target #2, got #{tid_b}"
-    assert _label(det_b) == "B", f"Expected B, got {_label(det_b)}"
-    print(f"  -> #{tid_b} {_label(det_b)}   cursor: {scanner.cursor_position}")
-
-    # ── Round 1 continued: person moved, re-detect → [B, C, D] ────
-    faces_r2 = [
-        Detection(bbox=BBox(x1=300, y1=160, x2=370, y2=240), score=0.90),  # B  cx=335
-        Detection(bbox=BBox(x1=500, y1=300, x2=580, y2=390), score=0.88),  # C  cx=540
-        Detection(bbox=BBox(x1=800, y1=400, x2=880, y2=500), score=0.85),  # D  cx=840  (new!)
-    ]
-
-    sorted_r2 = scanner.sort_faces(faces_r2)
-    print(f"\nRe-detect (people moved, A gone, D appeared): "
-          + ", ".join(_label(d) for d in sorted_r2))
-    print(f"  cursor: {scanner.cursor_position}")
-
-    # Next after B → must be C (NOT re-scan B, NOT skip C)
-    tid_c, det_c = scanner.select_next(sorted_r2)
-    assert tid_c == 3, f"Expected target #3, got #{tid_c}"
-    assert _label(det_c) == "C", (
-        f"CORRECT: cursor skipped B (already past), picked C. Got {_label(det_c)}"
-    )
-    print(f"  -> #{tid_c} {_label(det_c)}   (skipped B=already past)  cursor: {scanner.cursor_position}")
-
-    # Next after C → must be D (the new face)
-    tid_d, det_d = scanner.select_next(sorted_r2)
-    assert tid_d == 4, f"Expected target #4, got #{tid_d}"
-    assert _label(det_d) == "D", f"Expected D, got {_label(det_d)}"
-    print(f"  -> #{tid_d} {_label(det_d)}   (new face, picked up)  cursor: {scanner.cursor_position}")
-
-    # No more → None
-    tid_e = scanner.select_next(sorted_r2)
-    assert tid_e is None, "Expected None after D"
-    print(f"  -> None  (no more targets after D)")
-
-    # ── Verify A was never re-scanned ─────────────────────────────
-    print("\n--- Verification ---")
-    print("  A was NOT re-scanned  ✓  (A gone from detection + cursor already past)")
-    print("  B was NOT re-scanned  ✓  (cursor already past B's position)")
-    print("  C was picked          ✓  (first face after cursor)")
-    print("  D was picked          ✓  (new face after C)")
-    print("  Cursor never went backward  ✓")
-
-
-def detect_with_haar(image) -> list[Detection]:
-    """Fallback face detector using OpenCV Haar cascade (no Triton needed)."""
-    import cv2
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
-    rects = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
-    detections = []
-    for x, y, w, h in rects:
-        detections.append(
-            Detection(bbox=BBox(x1=int(x), y1=int(y), x2=int(x + w), y2=int(y + h)), score=1.0)
-        )
-    return detections
-
-
-def test_detector_pipeline() -> None:
-    """Load real image → detect faces → sort via Scanner.
-
-    Tries Triton detector first, falls back to OpenCV Haar cascade.
-    """
-    import cv2
-    from src.config import Config
-    from src.detector import Detector, HAS_TRITON
-
-    print("\n" + "=" * 60)
-    print("TEST: Detector → Scanner pipeline (real image)")
-    print("=" * 60)
-
-    PHOTO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "photo")
-    photos = sorted(f for f in os.listdir(PHOTO_DIR) if f.lower().endswith((".jpg", ".png")))
-    if not photos:
-        print("  No photos found in data/photo/")
-        return
-
-    # ── Load multiple photos and arrange detections as panoramic ───
-    # Each photo's face gets placed side-by-side to simulate a panoramic view
-    offset_x = 0
-    all_detections: list[Detection] = []
-    image_names: list[str] = []
-
-    for fname in photos[:5]:  # use up to 5 photos
-        path = os.path.join(PHOTO_DIR, fname)
-        img = cv2.imread(path)
-        if img is None:
-            print(f"  SKIP {fname}: cannot read")
-            continue
-
-        h, w = img.shape[:2]
-
-        # Try Triton detector, fall back to Haar
-        detections = []
-        if HAS_TRITON:
-            config = Config({
-                "triton": {"url": "localhost:8001", "detection_model": "face_detection",
-                           "detection_input_size": [640, 640]},
-                "detection": {"score_threshold": 0.5, "min_face_width": 30, "min_face_height": 30},
-                "video": {"panoramic_url": "mock"},
-                "device": {"address": "mock", "username": "mock", "password": "mock"},
-                "vector_db": {"path": ":memory:"},
-            })
-            det = Detector(config)
-            if det.health_check():
-                detections = det.detect(img)
-                print(f"  {fname}: Triton detected {len(detections)} face(s)")
-            else:
-                print(f"  {fname}: Triton not available, using Haar cascade")
-
-        if not detections:
-            detections = detect_with_haar(img)
-
-        # Shift detection coordinates to panoramic layout
-        for d in detections:
-            shifted = Detection(
-                bbox=BBox(
-                    x1=d.bbox.x1 + offset_x,
-                    y1=d.bbox.y1,
-                    x2=d.bbox.x2 + offset_x,
-                    y2=d.bbox.y2,
-                ),
-                score=d.score,
-            )
-            all_detections.append(shifted)
-            image_names.append(fname)
-
-        offset_x += w
-
-    if not all_detections:
-        print("  No faces detected in any photo")
-        return
-
-    # ── Print raw detections ───────────────────────────────────────
-    print(f"\n--- Raw detections ({len(all_detections)} faces from {len(set(image_names))} images) ---")
-    for i, (d, name) in enumerate(zip(all_detections, image_names)):
-        b = d.bbox
-        print(f"  [{i}] {name:12s}  ({b.x1:4d},{b.y1:4d})-({b.x2:4d},{b.y2:4d})  "
-              f"cx={b.cx:6.0f} cy={b.cy:5.0f}  score={d.score:.2f}")
-
-    # ── Sort ────────────────────────────────────────────────────────
-    config = Config({
-        "scan": {"row_bucket": 80},
-        "video": {"panoramic_url": "mock"},
-        "device": {"address": "mock", "username": "mock", "password": "mock"},
-        "triton": {"url": "mock"},
-        "vector_db": {"path": ":memory:"},
-    })
-    scanner = Scanner(config)
-    sorted_faces = scanner.sort_faces(all_detections)
-
-    print(f"\n--- Sorted (top→bottom, left→right, row_bucket=80) ---")
-    for i, d in enumerate(sorted_faces):
-        b = d.bbox
-        row_bkt = int(b.cy // 80)
-        idx = all_detections.index(d)
-        print(f"  [{i}] {image_names[idx]:12s}  cx={b.cx:6.0f} cy={b.cy:5.0f}  row_bucket={row_bkt}")
-
-    # ── Simulate cursor progression ────────────────────────────────
-    print(f"\n--- Scan-cursor progression ---")
+    tid = 0
     while True:
         target = scanner.select_next(sorted_faces)
         if target is None:
-            print("  -> No more targets")
             break
-        tid, det = target
+        tid += 1
+        _, det = target
         b = det.bbox
-        idx = all_detections.index(det)
-        print(f"  -> Target #{tid:2d}  {image_names[idx]:12s}  "
-              f"cx={b.cx:6.0f} cy={b.cy:5.0f}")
 
-
-def test_ptz_scheduling() -> None:
-    """Scanner → PTZController scheduling chain.
-
-    Uses mock PTZ (no real device). For each target the scanner picks,
-    calculates PTZ coordinates and simulates multi-stage zoom execution.
-    """
-    import cv2
-    from src.config import Config
-    from src.ptz_controller import PTZController
-
-    print("\n" + "=" * 60)
-    print("TEST: Scanner → PTZ scheduling (mock device)")
-    print("=" * 60)
-
-    PHOTO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "photo")
-    photos = sorted(f for f in os.listdir(PHOTO_DIR) if f.lower().endswith((".jpg", ".png")))
-    if not photos:
-        print("  No photos found in data/photo/")
-        return
-
-    config = Config({
-        "scan": {"row_bucket": 80, "max_zoom_stages": 3,
-                 "ptz_stable_wait_ms": 100, "ptz_retry": 2},
-        "device": {
-            "address": "mock",
-            "port": 8000,
-            "username": "mock",
-            "password": "mock",
-            "channel": 2,
-            "panoramic_resolution": {"cols": 6000, "rows": 2000},
-            "box_percent": 0.5,
-        },
-        "video": {"panoramic_url": "mock"},
-        "triton": {"url": "mock"},
-        "vector_db": {"path": ":memory:"},
-    })
-
-    scanner = Scanner(config)
-    ptz = PTZController(config)
-
-    # ── Build detections from photos (panoramic layout) ────────────
-    offset_x = 0
-    all_detections: list[Detection] = []
-    image_names: list[str] = []
-
-    for fname in photos[:5]:
-        img = cv2.imread(os.path.join(PHOTO_DIR, fname))
-        if img is None:
+        emb = extract_embedding(rec_session, img, b)
+        if emb is None:
+            print(f"#{tid:>3}  {'<failed>':12s}  {'---':>10}  {det.score:.3f}")
             continue
-        for d in detect_with_haar(img):
-            shifted = Detection(
-                bbox=BBox(
-                    x1=d.bbox.x1 + offset_x, y1=d.bbox.y1,
-                    x2=d.bbox.x2 + offset_x, y2=d.bbox.y2,
-                ),
-                score=d.score,
-            )
-            all_detections.append(shifted)
-            image_names.append(fname)
-        offset_x += img.shape[1]
 
-    if not all_detections:
-        print("  No faces detected")
-        return
+        results = db.search(emb, top_k=5)
+        top1_name, top1_sim = results[0]
+        print(f"#{tid:>3}  {top1_name:12s}  {top1_sim:>10.4f}  {det.score:.3f}  "
+              f"({b.x1},{b.y1})-({b.x2},{b.y2})")
 
-    sorted_faces = scanner.sort_faces(all_detections)
-    print(f"  {len(sorted_faces)} faces sorted\n")
+    db.close()
+    print("\nDone.")
 
-    # ── Schedule: scanner → PTZ for each target ────────────────────
-    max_stages = config.get("scan.max_zoom_stages")
-    target_idx = 0
 
-    while True:
-        target = scanner.select_next(sorted_faces)
-        if target is None:
-            print("  === No more targets, round complete ===")
-            break
+def main():
+    parser = argparse.ArgumentParser(description="FaceTrack PTZ minimal main flow")
+    parser.add_argument("image", nargs="?", help="Path to image file")
+    args = parser.parse_args()
 
-        tid, det = target
-        b = det.bbox
-        idx = all_detections.index(det)
-        target_idx += 1
-
-        print(f"  ── Target #{tid}  ({image_names[idx]})  "
-              f"bbox=({b.x1},{b.y1})-({b.x2},{b.y2}) ──")
-
-        # Stage 0: record only (no PTZ move)
-        print(f"    Stage 0 (panoramic):  cx={b.cx:.0f} cy={b.cy:.0f}")
-
-        # Stages 1..N: calculate PTZ coords, simulate move
-        for stage in range(1, max_stages + 1):
-            rect = ptz.calculate_coordinates(b, stage_num=stage)
-            print(f"    Stage {stage}:  PTZ rect=({rect[0]:3d},{rect[1]:3d},{rect[2]:3d},{rect[3]:3d})  "
-                  f"→ [mock move OK, wait stable]")
-
-        print(f"    ✓ target done\n")
-
-    print(f"  Total targets scheduled: {target_idx}")
+    if args.image:
+        run(args.image)
+    else:
+        photos = sorted(glob.glob(os.path.join(PHOTO_DIR, "*.jpg")))
+        if photos:
+            run(photos[0])
+        else:
+            print("No images found")
 
 
 if __name__ == "__main__":
     main()
-    test_dynamic_input()
-    test_detector_pipeline()
-    test_ptz_scheduling()
