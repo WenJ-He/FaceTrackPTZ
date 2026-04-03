@@ -41,7 +41,7 @@ scan:
 
 vector_db:
   type: "sqlite"
-  path: "./data/face_vectors.db"
+  path: "./data/face_db.sqlite"
 
 report:
   output_dir: "./reports"
