@@ -33,14 +33,14 @@ from src.logger import setup_logging
 
 PROJECT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(PROJECT, "config.yaml")
-MODEL_DET = os.path.join(PROJECT, "models", "facedect", "1", "model.onnx")
+MODEL_DET = os.path.join(PROJECT, "models", "facedect", "1280", "best.onnx")
 MODEL_REC = os.path.join(PROJECT, "models", "facerecognize", "1", "model.onnx")
 PHOTO_DIR = os.path.join(PROJECT, "data", "photo")
 
 
 def detect_faces(session, frame, score_thresh=0.5, nms_iou=0.5):
     h, w = frame.shape[:2]
-    blob = cv2.dnn.blobFromImage(frame, 1.0 / 255.0, (640, 640), swapRB=True)
+    blob = cv2.dnn.blobFromImage(frame, 1.0 / 255.0, (1280, 1280), swapRB=True)
     raw = session.run(["output0"], {"images": blob})[0]
     preds = raw[0].T
     results = []
@@ -49,7 +49,7 @@ def detect_faces(session, frame, score_thresh=0.5, nms_iou=0.5):
         if score < score_thresh:
             continue
         cx, cy, bw, bh = row[0], row[1], row[2], row[3]
-        sx, sy = w / 640, h / 640
+        sx, sy = w / 1280, h / 1280
         x1 = int((cx - bw / 2) * sx)
         y1 = int((cy - bh / 2) * sy)
         x2 = int((cx + bw / 2) * sx)
@@ -222,7 +222,7 @@ def run(image_path):
                 sm.transition(State.MOVING)
                 rect = ptz.calculate_coordinates(bbox, stage_num)
                 print(f"  PTZ stage {stage_num}: rect=({rect[0]:3d},{rect[1]:3d},"
-                      f"{rect[2]:3d},{rect[3]:3d}) (mock)")
+                      f"{rect[2]:3d},{rect[3]:3d})")
 
                 sm.transition(State.RECOGNIZING)
                 rec_s, _ = recognize_at_stage(rec_session, img, bbox, db, top_k)

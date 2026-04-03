@@ -1,8 +1,8 @@
 # FaceTrack PTZ Configuration
 
 video:
-  panoramic_url: "rtsp://admin:vision123456@192.168.0.248:554/Streaming/Channels/101"
-  ptz_url: "rtsp://admin:vision123456@192.168.0.248:554/Streaming/Channels/201"
+  panoramic_url: "rtsp://admin:vision123456@192.168.0.248:554/Streaming/Channels/201"
+  ptz_url: "rtsp://admin:vision123456@192.168.0.248:554/Streaming/Channels/202"
 
 device:
   address: "192.168.0.248"
@@ -19,7 +19,7 @@ triton:
   url: "localhost:8001"
   detection_model: "face_detection"
   recognition_model: "face_recognition"
-  detection_input_size: [640, 640]
+  detection_input_size: [1280, 1280]
   recognition_input_size: [112, 112]
 
 detection:
@@ -60,6 +60,14 @@ reconnect:
   interval_ms: 5000
 
 ptz:
-  mode: "isapi"
-  ctrl_binary: ""
-  ctrl_lib_path: ""
+  mode: "hkctl"
+  camera_binary: "/mnt/e/hwj/hkctl/build/camera"
+  ctrl_binary: "/mnt/e/hwj/hkctl/build/ctrl"
+  ctrl_lib_path: "/mnt/e/hwj/hkctl/libs"
+  # Resolution that C++ camera.cpp has hardcoded internally
+  camera_resolution:
+    cols: 3632
+    rows: 1632
+  # fallback modes:
+  #   mode: "isapi"       - HTTP ISAPI to Hikvision device
+  #   mode: "subprocess"  - pipe 0-255 coords to ctrl binary
